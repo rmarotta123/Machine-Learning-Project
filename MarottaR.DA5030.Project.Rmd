@@ -1,0 +1,402 @@
+---
+title: "DA5030"
+author: "Robert Marotta"
+output: pdf_document
+---
+## Loading libraries and retrieving data
+```{r, message=FALSE}
+library(tidyverse)
+library(psych)
+library(C50)
+library(caret)
+library(randomForest)
+library(naivebayes)
+library(pROC)
+```
+First we load in the libraries we will be using
+
+```{r}
+download.file("https://archive.ics.uci.edu/ml/machine-learning-databases/00577/codon_usage.csv.zip", "data_zip")
+unzip("data_zip")
+org_codon_df <- read.csv("codon_usage.csv")
+head(org_codon_df)
+```
+Next, we retrieve our data from the UCI Machine Learning Repository. The data is held in a zip file, so first we download the zip file directly from the URL, then unzip it and load in the database.
+
+## Data exploration and preparation 
+```{r}
+str(org_codon_df)
+```
+To begin our data exploration, we first observe the structure of the database. We see that each row in the database represents a different species. The first few columns contain a mix of character and numeric descriptions of each species, such as their kingdom, or their species name.  
+The following 64 columns contain the relative frequency of each codon that appears within the species' genome. All of the codon frequencies across each row should add up to 1, with slight deviations being possible due to instrument error/input error. We can check this by summing the values for these columns in a given row. First, however, there is an issue with the first two codon columns. For some reason, these were entered in as characters instead of doubles. These will have to be coerced into doubles.
+
+```{r}
+summary(org_codon_df)
+```
+We can also view some summary statistics of each column in the data frame. As we saw before, the codons UUU and UUC were imported as characters, so we cannot see their summary statistics yet. For the other codons, however, their respective min and max do not go below or above 0/1, so they don't seem to have any odd data. 
+
+```{r}
+codon_df <- org_codon_df
+codon_df$Kingdom <- as.factor(codon_df$Kingdom)
+
+codon_df$UUU <- as.double(codon_df$UUU)
+codon_df$UUC <- as.double(codon_df$UUC) 
+
+which(is.na(codon_df$UUU))
+which(is.na(codon_df$UUC))
+```
+Since our target variable for this project is the Kingdom variable, we coerce that column into a factor.  
+Next we attempt to convert the first two codon columns into doubles, which results in a few NAs being introduced. We can find the indices of these NAs to observe why they were not correctly converted.
+
+```{r}
+org_codon_df[487,6:7]
+org_codon_df[5064,6:7]
+```
+For the first NA row, the UUU codon column contains what is likely part of the species name. For the second NA row, neither the UUU or UUC column has a value that could be considered a relative frequency.  
+Since these two rows make up a small fraction of the roughly 13000 total observations, we will just remove them.
+
+```{r}
+codon_df <- codon_df[-c(487, 5064),]
+summary(codon_df[,6:7])
+```
+With the NAs removed, we can now look at the summary statistics for the first two codon columns. These likewise don't seem to have any oddities in the data.
+
+```{r}
+prop.table(table(codon_df$Kingdom))*100
+```
+From the above proportion table, we can see we are dealing with an unbalanced data set. Certain kingdoms are represented much more in the data, such as bacteria (22.4%), viruses (21.7%), plants (19.4%), and vertebrates (15.9%). On the other end of the spectrum, plasmids are only represented in .14% of the data. As such, we predict that the models we construct will have an easier time classifying the kingdoms that are most prevalent.
+
+```{r}
+head(cor(codon_df[,6:69]))
+```
+Next we construct a very large correlation matrix to look for any colinearities in the data. Although it is difficult to parse a matrix of this size, we can see that certain codons have very high correlations (between .7 and .9). A large number of codons also have moderately strong correlations (between .4 and .6). Because of these colinearities, there may be some redundancy in the data. This makes the data set a potentially good target for PCA, which can reduce that redundancy along with the complexity of the model.
+
+```{r}
+codon_df <- codon_df[,-c(2:5)]
+dim(codon_df)
+```
+Our goal for this project is to classify species kingdom based on the relative codon frequency. As such, the species ID and name, the total number of codons, and the DNA type are not relevant to this and shoul therefore be removed. We are left with 65 columns, 1 for the kingdom, and 64 for each codon.
+
+## Outlier treatment
+```{r}
+det_out <- function(x) {
+  quartile <- quantile(x, probs=c(.25,.75))
+  var_IQR <- IQR(x)
+  lower <- quartile[1] - 1.5*var_IQR
+  upper <- quartile[2] + 1.5*var_IQR
+  ifelse(x < lower | x > upper, NA, x)
+}
+codon_df_imp <- codon_df
+codon_df_imp[,2:65] <- sapply(codon_df_imp[,2:65], det_out)
+sum(!complete.cases(codon_df_imp))
+```
+In order to observe how many outliers there are in our data, we first have to define what we consider to be an outlier. For the purposes of this project, an outlier was defined using the interquartile range.  
+We set up a function that defines this range and apply it to each codon in our data set, and create a new data frame to hold the outliers. Any values that fall outside of this range are replaced with NA, while everything else is left alone.  
+We can then find how many observations in our data have an outlier by looking at the number of incomplete cases in our new data frame. It looks like there are 8296 rows that contain at least one outlier. This represents a much larger proportion of our data compared to the missing values, so instead of removing these outliers, we will instead impute them.
+
+```{r}
+codon_df_imp[,2:65] <- sapply(codon_df_imp[,2:65], function(x) ifelse(is.na(x),
+                                                                      mean(x,na.rm=T), x))
+sum(!complete.cases(codon_df_imp))
+```
+We replace the NAs of each column with the mean of their column. Looking again at the amount of complete cases, we see that there are no rows containing NA.  
+Going forward, we will be comparing the performance of the data set containing outliers against the data set with outliers that have been replaced
+
+## Distribution analysis
+```{r out.width="150%", out.height="150%"}
+long_codon <- codon_df[,2:65] %>%
+  pivot_longer(cols=UUU:UGA, names_to="variable", values_to="value")
+ggplot(long_codon, aes(x=value))+
+  stat_density()+
+  facet_wrap(~variable, scales="free")+
+  geom_line(aes(y=dnorm(value,
+                        mean=tapply(value, variable, mean)[PANEL],
+                        sd=tapply(value, variable, sd)[PANEL])), color="red")+
+  ylab("density")+
+  theme(axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+```
+We can visualize the distribution of each variable in our data set by observing a facet-wrapped distribution plot. Each plot has been overlaid with its own normal curve to show how well the data fits a normal distribution.  
+In order to create this plot, we first have to long pivot our table into one with two total variables:  1 that contains the codon and another that contains the frequency. We can then view the distribution of frequency and wrap the plots around the codon.  
+Although there are a large number of columns in our data, the distributions appear to be fairly similar with few exceptions. The data across the board seems to be fairly normal, with outliers causing it to skew right. As such, we predict that the distributions of the imputed outlier columns will appear more normally distributed.
+
+```{r out.width="150%", out.height="150%"}
+long_codon <- codon_df_imp[,2:65] %>%
+  pivot_longer(cols=UUU:UGA, names_to="variable", values_to="value")
+ggplot(long_codon, aes(x=value))+
+  stat_density()+
+  facet_wrap(~variable, scales="free")+
+  geom_line(aes(y=dnorm(value,
+                        mean=tapply(value, variable, mean)[PANEL],
+                        sd=tapply(value, variable, sd)[PANEL])), color="red")+
+  ylab("density")+
+  theme(axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+```
+As expected, the distributions are much more centered and tend to fit their normal curve well. This is good since PCA assumes normality in the data.
+
+## Splitting the data
+```{r}
+set.seed(300)
+train_index <- sample.int(nrow(codon_df), size=floor(nrow(codon_df)*.8))
+train_data <- codon_df[train_index,]
+test_data <- codon_df[-train_index,]
+
+train_imp <- codon_df_imp[train_index,]
+test_imp <- codon_df_imp[-train_index,]
+```
+Since we are going to be performing PCA, we will split the data into our training and testing sets beforehand. We have a very large amount of data, so allotting 80% into our training set should still leave a sizable enough amount of data in our testing set.
+
+## PCA
+```{r}
+codon_pca <- prcomp(train_data[,-1], center=TRUE, scale=TRUE)
+summary(codon_pca)
+```
+We now perform PCA on our training data to find the principal components of the set. We can view of a summary of the findings which show the amount of variance explained by each component. It seems that the first two components together explain roughly 48.4% of the total variance. For our models, we will choose the amount of components we will utilize using Kaiser's law. Principal components 1 through 8 have a standard deviation significantly above 1, so we will use 8 components. Although 9 and 10 also have standard deviations above 1, they only barely pass, so for the sake of model simplicity, we limit it to 8 components.
+
+```{r}
+plot(codon_pca, type="l")
+```
+We can also use visualize the variance using a scree plot. This plot shows that 2 or 3 components may also be worth using since any furhter components only represent small gains in variance. However, we will be sticking to our decision of 8 components.
+
+```{r}
+imp_pca <- prcomp(train_imp[,-1], center=TRUE, scale=TRUE)
+summary(imp_pca)
+```
+We also perform PCA on our data with imputed outliers. Overall the result is not much different than the data that included outliers. By 8 components, the cumulative proportion of variance is slightly lower (64% vs. 69%). For the sake of consistency, we will also be using 8 components for the imputed data set.
+
+```{r}
+plot(imp_pca, type="l")
+```
+Again, we create a scree plot for the imputed PCA which, overall, looks very similar to the non-imputed data. 
+
+## Final Data Preparation
+```{r}
+train_pca <- as.data.frame(codon_pca$x)
+train_pca <- cbind(train_pca, train_data[,1])
+colnames(train_pca)[65] <- "Kingdom"
+pairs.panels(train_pca[1:8])
+```
+Before we can build or models, we have to complete our data preparation. First, we take the PCA values from the non-imputed data and store it in a new data frame. Then, we bind the labels from the training set onto this and rename the column to something more informative. We then view the distribution and correlation of the 8 components.  
+The data appears to be fairly normally distributed for each component, and, because of PCA, there are no colinearities amongst any of the variables.
+
+```{r}
+train_pca_imp <- as.data.frame(imp_pca$x)
+train_pca_imp <- cbind(train_pca_imp, train_imp[,1])
+colnames(train_pca_imp)[65] <- "Kingdom"
+pairs.panels(train_pca_imp[1:8])
+```
+We repeat this process for the imputed data, and view their correlations and distributions.  
+Again, the data is, for the most part, normally distributed with no colinearities.
+
+```{r}
+test_pca <- predict(codon_pca, newdata=test_data[,-1])
+test_pca <- as.data.frame(test_pca)
+test_pca <- cbind(test_pca, test_data[,1])
+colnames(test_pca)[65] <- "Kingdom"
+head(test_pca)
+```
+Since our test data is supposed to be unseen, we apply the PCA done on our training data to our testing data. We then, again, put that data into a data frame and bind the labels to it. 
+
+```{r}
+test_pca_imp <- predict(imp_pca, newdata=test_imp[,-1])
+test_pca_imp <- as.data.frame(test_pca_imp)
+test_pca_imp <- cbind(test_pca_imp, test_imp[,1])
+colnames(test_pca_imp)[65] <- "Kingdom"
+head(test_pca_imp)
+```
+Lastly, we repeat the above process with the imputed data.
+
+## KNN
+The first model we will build is a knn model. In terms of classification, this model is very similar but can perform surprisingly well. We will not need to scale our data since we are dealing with relative frequencies, so the lowest/highest possible values are 0 and 1 for each column. We will use the caret package to perform 10-fold cross validation 3 times when constructing our model.
+
+### With outliers
+```{r}
+set.seed(300)
+ctrl <- trainControl(method="repeatedcv",repeats = 3,classProbs=TRUE)
+codon_knn <- train(x=train_pca[,1:8], y=train_pca[,65], method="knn", trControl=ctrl)
+codon_knn
+```
+We can see that the caret package successfully created our knn model using 10-fold cross validation. It also tuned our model and found that the model was most accurate (84%) when k was equal to 5. 
+
+```{r}
+test_knn <- predict(codon_knn, test_pca[,1:8])
+confusionMatrix(data=test_knn, reference=test_pca[,65], mode="prec_recall")
+```
+We then can use this model to classify our test data. The resulting confusion matrix displays a lot of useful information regarding our model's performance. Firstly, the overall accuracy (83%) is fairly high, and also extremely close to the training set's accuracy, demonstrating that our model did not overfit the data.  
+Looking at the F1 scores, which balance precision and recall, we can see that, as expected, our model was significantly better at classifying kingdoms with a higher prevalence. Interestingly, vertebrate had a significantly higher F1 score compared to viruses or plants despite having a lower prevalence.  
+For the most part, our model performed well for each of the different classes, with the exception of plasmids. The model did not classify any of the test data as plasmids, which is not unexpected since they represent a fraction of a percentage of the total data.
+
+### With imputed outliers
+```{r}
+set.seed(300)
+ctrl <- trainControl(method="repeatedcv",repeats = 3)
+imp_knn <- train(x=train_pca_imp[,1:8], y=train_pca_imp[,65], method="knn", trControl=ctrl)
+imp_knn
+```
+We use the caret package to create a model of the imputed training data with identical parameters as the non-imputed training data. The resulting model is similar to the non-imputed model, with an only slightly lower performance. Again, the optimal k value found was 5.
+
+```{r}
+test_imp_knn <- predict(imp_knn, test_pca_imp[,1:8])
+confusionMatrix(data=test_imp_knn, reference=test_pca_imp[,65], mode="prec_recall")
+```
+Although the confusion matrix demonstrates that the two models performed fairly similarly, there are some small differences that are interesting. Firstly, the difference between the accuracy on the training data and the testing data is small, just like the previous model. However, the difference in accuracies was around 1.7% for this model and less than 1% for the previous model. The second model may have overfit the data moreso than the first due to it including imputed mean data.  
+Another point of interest is that, when looking at F1 scores, the second model performed only slightly worse with classes that have a high prevalence (eg. 88% vs. 91% for vertebrate), but performed significantly worse on low relevance classes (eg. 40$ vs. 51% for prions).
+
+### ROC
+```{r}
+knn_probs <- predict(codon_knn, test_pca[,1:8], type="prob")
+multiclass.roc(test_pca[,65], knn_probs)
+```
+We can also find the AUC value for the multiclass ROC. We use the knn model built on data containing outliers since it overall performed better. This model had a AUC value of .8914. Since this value is close to 1, we can say that the model did a good job in distinguishing the different classes.
+
+### Component Performance
+```{r}
+knn.values <- rep(0, 10)
+for(i in 2:10) {
+  set.seed(300)
+  ctrl <- trainControl(method="repeatedcv",repeats = 3)
+  codon_knn <- train(x=train_pca[,1:i], y=train_pca[,65], method="knn", trControl=ctrl)
+  test_knn <- predict(codon_knn, test_pca[,1:i])
+  conf_matrix <- confusionMatrix(data=test_knn, reference=test_pca[,65], mode="prec_recall")
+  knn.values[i] <- conf_matrix$overall[1]
+}
+plot(x=c(2:10), y=knn.values[2:10], type="l", xlab="# of Components", ylab="Overall Accuracy")
+```
+We can also look at how changing the amount of components we use affects our model's performance. Again, we use the model with outliers since it performed better. From 2 to 10 components, we can see that there is a sharp increase in accuracy up until around 5 or 6 components. After this, there is a small, yet steady increase in accuracy. Therefore, when choosing the amount of components to use, you can opt for 5/6 components if complexity is a large concern, 10 if total accuracy is a higher concern, or somewhere in the middle if both are important to consider.
+
+## Naive Bayes
+Naive Bayes is a popular classifier due to its simplicity and surprisingly high performance. It exceeds in tasks such as spam recognition. It does, however, make two assumptions. One being that the data is normal, which in our case it is, and the other being that the variables are conditionally independent of each other. This second assumption likely doesn't hold to due the fact that certain codons are likely to be more heavily inked with others due to biological functions. Even though this assumption is likely not met, we will still build a Naive Bayes model and evaluate its performance. We expect for it to perform worse than the knn model.
+
+### With outliers
+```{r}
+set.seed(300)
+nb_pca <- naive_bayes(train_pca[,1:8], train_pca[,65])
+nb_pca_pred <- predict(nb_pca, test_pca[,1:8])
+confusionMatrix(data=nb_pca_pred, reference=test_pca[,65], mode="prec_recall")
+```
+First we train our model on the training data, then apply it to our test data. Finally, we construct a confusion matrix to visualize our results. As expected, the Naive Bayes model performed significantly worse all around compared to the knn models. F1 scores were lower across all of the variables, with the model performing especially worse on low prevalence classes (17% for prions).  
+Interestingly, the model performed significantly worse when classifying invertebrates (41%) when compared to mammals (60%) despite mammals having half the prevalence of invertebrates (10% vs 5%). Perhaps mammals are sufficiently different from the other classes, making them easier to distinguish, and invertebrates are more similar to other classes, making them harder to distinguish.
+
+### With imputed outliers
+```{r}
+set.seed(300)
+nb_pca_imp <- naive_bayes(train_pca_imp[,1:8], train_pca_imp[,65])
+nb_pca_imp_pred <- predict(nb_pca_imp, test_pca_imp[,1:8])
+confusionMatrix(data=nb_pca_imp_pred, reference=test_pca_imp[,65], mode="prec_recall")
+```
+We repeat the above process with the imputed data. Unlike the knn models, the imputed model appears to have performed slightly better than the non-imputed model when using total accuracy as the metric (65% vs 63%). Overall, however, the two models are very similar.  
+One interesting difference is that both models were unable to correctly classify rodents, but the first model was able to classify prions but not plasmids while the second was able to classify plasmids and not prions. 
+
+### ROC
+```{r}
+nb_probs <- predict(nb_pca_imp, test_pca_imp[,1:8], type="prob")
+multiclass.roc(test_pca_imp[,65], nb_probs)
+```
+Since the imputed model performed slightly better, we calculate AUC using this model. Surprisingly, despite being significantly less accurate than the knn models, the Naive Bayes model had a slightly higher AUC.
+
+### Component Performance
+```{r}
+acc_values <- rep(0, 15)
+for (i in 2:15) {
+  set.seed(300)
+  codon_nb <- naive_bayes(train_pca_imp[,1:i], train_pca_imp[,65])
+  nb_pred <- predict(codon_nb, test_pca_imp[,1:i])
+  conf_matrix <- confusionMatrix(data=nb_pred, reference=test_pca[,65], mode="prec_recall")
+  acc_values[i] <- conf_matrix$overall[1]
+}
+plot(x=c(2:15), y=acc_values[2:15], type="l", xlab="# of Components", ylab="Overall Accuracy")
+```
+Again we can look at the tradeoff between accuracy and number of components. For Naive Bayes, a good component number when valuing simplicity seems to be 8. The model appears to perform best when using 13 components. Naive Bayes are extremely quick to construct, so it is likely you would value accuracy more in this case.
+
+## Single Decision Trees
+The final type of model we will be constructing is decision trees. These are a popular classifier due to their relatively high performance along with the fact that they require little preprocessing of the data in order to function well. For our purposes, the data was already very clean from the start, so this last benefit is not as important to us. Decision tree models are prone to overfitting, however. Our other models have not had a serious overfitting problem so far, so this hopefully will not be an issue. 
+### With outliers
+```{r}
+set.seed(300)
+tree_pca <- C5.0(x=train_pca[,1:8], train_pca[,65])
+tree_pca_pred <- predict(tree_pca, test_pca[,1:8])
+confusionMatrix(data=tree_pca_pred, reference=test_pca[,65], mode="prec_recall")
+```
+We construct our model using the non-imputed training data, validate it on our testing data, and visualize the results in a confusion matrix. Although this is only a single decision tree, the resulting model is quite accurate at 75.4%. This places it somewhere between the Naive Bayes models and the knn models.  
+The model appears to follow the trends in the previous models by performing better on higher prevalent kingdoms compared to less prevalent ones. 
+
+### With imputed outliers
+```{r}
+set.seed(300)
+tree_pca_imp <- C5.0(x=train_pca_imp[,1:8], train_pca_imp[,65])
+tree_pca_imp_pred <- predict(tree_pca_imp, test_pca_imp[,1:8])
+confusionMatrix(data=tree_pca_imp_pred, reference=test_pca_imp[,65], mode="prec_recall")
+```
+We repeat the above with the imputed data. Similarly to the knn models, the imputed data set performed slightly worse than the non-imputed (74% vs 75%).  
+Both models display a similar trend to the Naive Bayes models in which the mammal kingdom displays surprisingly high F1 scores (64%) despite its low prevalence (5%). It again outperforms invertebrates (61%) despite being less prevalent.
+
+## Boosted decision trees
+In order to improve the performance of our tree models, we can boost our trees by adding more and more trees to the model. The philosophy behind this ensemble learning is that the collective model will perform better than any individual tree within it.
+
+### With outliers
+```{r}
+set.seed(300)
+boosted_pca <- C5.0(x=train_pca[,1:8], train_pca[,65], trials=10)
+boosted_pca_pred <- predict(boosted_pca, test_pca[,1:8])
+confusionMatrix(data=boosted_pca_pred, reference=test_pca[,65], mode="prec_recall")
+```
+We create our model similarly to above, this time creating a boosted model with 10 trees. With only 10 trees, the boosted model performed significantly better compared to the single tree (82% vs. 75%). The model appears to have improved across all of the columns compared to the single tree.
+
+### With imputed outliers
+```{r}
+set.seed(300)
+boosted_pca_imp <- C5.0(x=train_pca_imp[,1:8], train_pca_imp[,65], trials=10)
+boosted_pca_imp_pred <- predict(boosted_pca_imp, test_pca_imp[,1:8])
+confusionMatrix(data=boosted_pca_imp_pred, reference=test_pca_imp[,65], mode="prec_recall")
+```
+We repeat the above using the imputed data. The boosted model again demonstrates a higher accuracy compared to the non-boosted model (79% vs 74%). Like the previous model, the boosted model appears to have performed better across the board compared to the non-boosted model.
+
+## Random Forest
+We also use another type of ensemble learning called random forest. This model is similar to boosting, except that boosting involves trees being added one by one to the model while random forest does not.
+
+### With outliers
+```{r}
+set.seed(300)
+forest_pca <- randomForest(x=train_pca[,1:8], y=train_pca[,65])
+forest_pca_pred <- predict(forest_pca, test_pca[,1:8])
+confusionMatrix(data=forest_pca_pred, reference=test_pca[,65], mode="prec_recall")
+```
+The random forest model created from the non-imputed data performed slightly better than the boosted model (83% vs 82%) and significantly better than the single tree (83% vs 85%).
+
+### With imputed outliers
+```{r}
+set.seed(300)
+forest_pca_imp <- randomForest(x=train_pca_imp[,1:8], y=train_pca_imp[,65])
+forest_pca_imp_pred <- predict(forest_pca_imp, test_pca_imp[,1:8])
+confusionMatrix(data=forest_pca_imp_pred, reference=test_pca_imp[,65], mode="prec_recall")
+```
+The imputed random forest model performed moderately better than the boosted model (82% vs 79%) and significantly better than the single tree model (82% vs 74%).
+
+```{r}
+forest_probs <- predict(forest_pca, test_pca[,1:8], type="prob")
+multiclass.roc(test_pca[,65], forest_probs)
+```
+Since the non-imputed random forest model performed best, we calculate AUC using this model. The AUC for this is significantly higher than the other models and is extremely close to 1. Therefore, this model does a great job of distinguishing between the various classes.
+
+```{r}
+acc_values <- rep(0,15)
+for (i in 2:15) {
+  set.seed(300)
+  forest_mod <- randomForest(x=train_pca[,1:i], y=train_pca[,65])
+  forest_pred <- predict(forest_mod, test_pca[,1:i])
+  conf_matrix <- confusionMatrix(data=forest_pred, reference=test_pca[,65], mode="prec_recall")
+  acc_values[i] <- conf_matrix$overall[1]
+}
+plot(x=c(2:15), y=acc_values[2:15], type="l", xlab="# of Components", ylab="Overall Accuracy")
+```
+Again, using the non-imputed random forest model, we can find the amount of components that works best for our model. The trend shown mirrors that of the knn trend with 5/6 being favorable if the goal is to minimize complexity, 10 or higher if the goal is to maximize accuracy, and 8 being good for a balance of the two. 
+
+## Comparing Model Performance
+Of the three types of models we constructed in this project, the two most promising seem to be knn and decision trees. At their highest accuracy, both models were roughly equal at 83% accuracy. However, there are two significant differences between the performance of these models.
+The first difference is that the AUC of the ROC was significantly higher for the random forest model (.97 vs .89). Although both are very good AUCs, it appears that the random forest model is better at distinguishing the classes. Secondly, the random forest models took significantly less time to construct. This means that more components could be used in the random forest model in order to increase overall accuracy without sacrificing too much time. The higher time it takes to construct the knn model makes higher amounts of components more unfeasible.  
+As we expected, the Naive Bayes models performed particularly poorly with models failing to break 70% total accuracy. That being said, the AOC was still very high (.9) and the model construction was almost instantaneous, so there may be some cases where using Naive Bayes is more appropriate.
+
+## Comparing Performance by Outlier Treatment
+Overall, the data set containing outliers seemed to perform slightly better than the data set that replaced its outliers with imputed values. Its possible that this difference in performance is due to overfitting, since natural noise represented by the outliers were replaced by averaged values.  
+The one exception to this trend was in the Naive Bayes models where the imputed data performed slightly better. Its possible that this is due to Naive Bayes being less susceptible to overfitting.
